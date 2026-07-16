@@ -1,4 +1,11 @@
-"""Nautobot API client — GraphQL for reads, REST for writes."""
+"""Nautobot API client — GraphQL for reads, REST for writes.
+
+Compatible with Nautobot 2.x and 3.x:
+  - Auto-detects instance version via /api/status/
+  - On 3.x, appends exclude_m2m=False to REST GET requests so M2M fields
+    (like IP-to-interface assignments) are included in responses.
+  - The ip-address-to-interface endpoint works on both 2.x and 3.x.
+"""
 
 import json
 import logging
@@ -42,8 +49,44 @@ class NautobotClient:
             timeout=timeout,
         )
 
+        # Version detection (lazy, cached after first call)
+        self._nautobot_version: Optional[str] = None
+        self._is_v3: Optional[bool] = None
+
     async def close(self):
         await self.http.aclose()
+
+    # ── Version Detection ────────────────────────────────────────────
+
+    async def detect_version(self) -> str:
+        """Detect the Nautobot instance version via /api/status/. Cached after first call."""
+        if self._nautobot_version is not None:
+            return self._nautobot_version
+
+        try:
+            resp = await self.http.get(f"{self.url}/api/status/")
+            if resp.status_code == 200:
+                data = resp.json()
+                self._nautobot_version = data.get("nautobot-version", "2.0.0")
+            else:
+                self._nautobot_version = "2.0.0"
+        except Exception:
+            self._nautobot_version = "2.0.0"  # Assume 2.x if detection fails
+
+        try:
+            major = int(self._nautobot_version.split(".")[0])
+            self._is_v3 = major >= 3
+        except (ValueError, IndexError):
+            self._is_v3 = False
+
+        logger.info(f"Detected Nautobot version: {self._nautobot_version} (v3={self._is_v3})")
+        return self._nautobot_version
+
+    async def is_v3(self) -> bool:
+        """Return True if the Nautobot instance is version 3.x or later."""
+        if self._is_v3 is None:
+            await self.detect_version()
+        return self._is_v3
 
     # ── GraphQL ──────────────────────────────────────────────────────
 
@@ -107,6 +150,15 @@ class NautobotClient:
         json_body: Optional[dict] = None,
     ) -> dict[str, Any]:
         url = f"{self.url}/api/{endpoint.strip('/')}/"
+
+        # Nautobot 3.x excludes M2M fields by default. Always request them
+        # on GET so that IP-to-interface assignments and similar relations
+        # are visible in responses.
+        if method == "GET" and await self.is_v3():
+            if params is None:
+                params = {}
+            params.setdefault("exclude_m2m", "False")
+
         try:
             resp = await self.http.request(method, url, params=params, json=json_body)
         except httpx.ConnectError as e:
@@ -202,6 +254,39 @@ class NautobotClient:
         return uid
 
     # ── Helpers ───────────────────────────────────────────────────────
+
+    async def get(self, path: str, params: Optional[dict] = None) -> dict[str, Any]:
+        """Low-level GET using the full path (e.g. '/api/dcim/devices/')."""
+        url = f"{self.url}{path}" if path.startswith("/") else f"{self.url}/{path}"
+
+        # Nautobot 3.x: include M2M fields
+        if await self.is_v3():
+            if params is None:
+                params = {}
+            params.setdefault("exclude_m2m", "False")
+
+        try:
+            resp = await self.http.get(url, params=params)
+        except httpx.ConnectError as e:
+            raise NautobotConnectionError(f"Nautobot API unreachable: {e}")
+        except httpx.TimeoutException:
+            raise NautobotConnectionError("Nautobot request timed out.")
+        self._check_http(resp)
+        return resp.json()
+
+    async def post(self, path: str, json: Optional[dict] = None) -> dict[str, Any]:
+        """Low-level POST using the full path (e.g. '/api/ipam/ip-addresses/')."""
+        url = f"{self.url}{path}" if path.startswith("/") else f"{self.url}/{path}"
+        try:
+            resp = await self.http.post(url, json=json)
+        except httpx.ConnectError as e:
+            raise NautobotConnectionError(f"Nautobot API unreachable: {e}")
+        except httpx.TimeoutException:
+            raise NautobotConnectionError("Nautobot request timed out.")
+        self._check_http(resp)
+        if resp.status_code == 204:
+            return {}
+        return resp.json()
 
     def _check_http(self, resp: httpx.Response) -> None:
         if resp.status_code in (401, 403):
