@@ -390,6 +390,239 @@ async def nautobot_create_ip_address(
 
 
 @mcp.tool()
+async def nautobot_delete_ip_address(
+    address: Optional[str] = None,
+    ip_id: Optional[str] = None,
+    cr_number: Optional[str] = None,
+) -> str:
+    """Delete an IP address from Nautobot IPAM. Also removes any interface assignments. ITSM-gated.
+
+    Provide either the address (e.g. '142.129.5.98/28') or the UUID directly.
+    If the IP is assigned to interfaces, those M2M assignments are removed first.
+
+    Args:
+        address: IP address with mask to delete (e.g. '100.81.0.178/28')
+        ip_id: UUID of the IP address (alternative to address lookup)
+        cr_number: ServiceNow change request number (required if ITSM enabled)
+    """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
+
+    if not address and not ip_id:
+        return json.dumps({"error": "Provide either 'address' or 'ip_id'"})
+
+    logger.info(f"nautobot_delete_ip_address address={address} id={ip_id} cr={cr_number}")
+
+    try:
+        # Resolve address to UUID if needed
+        if not ip_id:
+            data = await client.graphql(
+                f'{{ ip_addresses(address: "{_esc(address)}") {{ id }} }}'
+            )
+            ips = data.get("ip_addresses", [])
+            if not ips:
+                return json.dumps({"error": f"IP address '{address}' not found in Nautobot"})
+            ip_id = ips[0]["id"]
+
+        # Remove any interface assignments first (M2M cleanup)
+        try:
+            assignments = await client.rest_get(
+                "ipam/ip-address-to-interface", {"ip_address": ip_id}
+            )
+            for record in assignments.get("results", []):
+                await client.rest_delete(f"ipam/ip-address-to-interface/{record['id']}")
+        except NautobotError:
+            pass  # No assignments or endpoint issue, continue with delete
+
+        # Delete the IP address object
+        await client.rest_delete(f"ipam/ip-addresses/{ip_id}")
+        return json.dumps({"deleted": True, "address": address, "id": ip_id})
+    except NautobotError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def nautobot_update_device_ip(
+    device: str,
+    interface: str,
+    new_ipv4: Optional[str] = None,
+    new_ipv6: Optional[str] = None,
+    namespace: str = "Global",
+    cr_number: Optional[str] = None,
+) -> str:
+    """Replace IP addresses on a device interface. Handles the full lifecycle:
+    prefix creation, new IP creation, interface assignment, and old IP cleanup.
+
+    Nautobot does not allow changing an IP's host address after creation, so this
+    tool creates new IPs and removes the old ones. Compatible with Nautobot 2.x and 3.x.
+
+    Use this for updating iDRAC management IPs or any interface IP replacement.
+
+    Args:
+        device: Device name or FQDN (e.g. 'sndhcaax-ak-hpc1001.spectrum.com')
+        interface: Interface name (e.g. 'iDRAC', 'Management1')
+        new_ipv4: New IPv4 address with mask (e.g. '100.81.0.178/28'), or None to skip
+        new_ipv6: New IPv6 address with mask (e.g. '2602:107:600:b8::178/64'), or None to skip
+        namespace: IPAM namespace (default 'Global')
+        cr_number: ServiceNow change request number (required if ITSM enabled)
+
+    Returns:
+        Summary of all changes made (prefixes created, IPs created/deleted, assignments)
+    """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
+
+    if not new_ipv4 and not new_ipv6:
+        return json.dumps({"error": "At least one of new_ipv4 or new_ipv6 must be provided"})
+
+    logger.info(f"nautobot_update_device_ip device={device} iface={interface} v4={new_ipv4} v6={new_ipv6} cr={cr_number}")
+
+    try:
+        # Step 1: Look up device and interface with current IPs
+        query = f"""{{
+  devices(name: "{_esc(device)}") {{
+    id
+    name
+    interfaces(name: "{_esc(interface)}") {{
+      id
+      name
+      ip_addresses {{ id address }}
+    }}
+  }}
+}}"""
+        result = await client.graphql(query)
+        devices = result.get("devices", [])
+        if not devices:
+            return json.dumps({"error": f"Device '{device}' not found in Nautobot"})
+
+        dev = devices[0]
+        ifaces = dev.get("interfaces", [])
+        if not ifaces:
+            return json.dumps({"error": f"Interface '{interface}' not found on device '{device}'"})
+
+        iface = ifaces[0]
+        iface_id = iface["id"]
+        existing_ips = iface.get("ip_addresses", [])
+
+        # Step 2: Resolve namespace
+        ns_id = await client.resolve_id("namespace", namespace)
+        status_id = await client.resolve_id("status", "Active")
+
+        changes: list[str] = []
+
+        # Process each address family
+        if new_ipv4:
+            await _replace_ip_on_interface(
+                new_ipv4, 4, iface_id, ns_id, status_id, existing_ips, changes
+            )
+        if new_ipv6:
+            await _replace_ip_on_interface(
+                new_ipv6, 6, iface_id, ns_id, status_id, existing_ips, changes
+            )
+
+        return json.dumps({
+            "success": True,
+            "device": device,
+            "interface": interface,
+            "changes": changes,
+        }, indent=2)
+    except NautobotError as e:
+        return json.dumps({"error": str(e)})
+
+
+async def _replace_ip_on_interface(
+    new_address: str,
+    ip_version: int,
+    interface_id: str,
+    namespace_id: str,
+    status_id: str,
+    existing_ips: list[dict],
+    changes: list[str],
+) -> None:
+    """Replace existing IP(s) of the given version on an interface with a new one.
+
+    Handles: parent prefix creation, new IP creation, M2M assignment,
+    old IP M2M removal, and old IP deletion.
+    """
+    import ipaddress as ipaddr
+
+    # Calculate the parent prefix (network address)
+    if ip_version == 4:
+        net = ipaddr.IPv4Network(new_address, strict=False)
+    else:
+        net = ipaddr.IPv6Network(new_address, strict=False)
+    prefix_cidr = str(net)
+
+    # Ensure parent prefix exists
+    pfx_check = await client.graphql(f'{{ prefixes(prefix: "{prefix_cidr}") {{ id }} }}')
+    if not pfx_check.get("prefixes"):
+        try:
+            await client.rest_post("ipam/prefixes", {
+                "prefix": prefix_cidr,
+                "namespace": namespace_id,
+                "status": status_id,
+            })
+            changes.append(f"Created prefix {prefix_cidr}")
+        except NautobotError as e:
+            changes.append(f"WARNING: Could not create prefix {prefix_cidr}: {e}")
+
+    # Create the new IP address
+    try:
+        ip_result = await client.rest_post("ipam/ip-addresses", {
+            "address": new_address,
+            "namespace": namespace_id,
+            "status": status_id,
+        })
+        new_ip_id = ip_result["id"]
+        changes.append(f"Created IP {new_address} (id: {new_ip_id})")
+    except NautobotError as e:
+        changes.append(f"ERROR: Could not create IP {new_address}: {e}")
+        return
+
+    # Assign new IP to interface via M2M
+    try:
+        await client.rest_post("ipam/ip-address-to-interface", {
+            "ip_address": new_ip_id,
+            "interface": interface_id,
+        })
+        changes.append(f"Assigned {new_address} to interface")
+    except NautobotError as e:
+        changes.append(f"ERROR: Could not assign {new_address} to interface: {e}")
+
+    # Identify and remove old IPs of the same address family
+    for old_ip in existing_ips:
+        old_addr = old_ip["address"]
+        old_id = old_ip["id"]
+        try:
+            host_str = old_addr.split("/")[0]
+            parsed = ipaddr.ip_address(host_str)
+            if parsed.version != ip_version:
+                continue
+        except ValueError:
+            continue
+
+        # Remove M2M assignment for the old IP
+        try:
+            assignments = await client.rest_get(
+                "ipam/ip-address-to-interface",
+                {"ip_address": old_id, "interface": interface_id},
+            )
+            for record in assignments.get("results", []):
+                await client.rest_delete(f"ipam/ip-address-to-interface/{record['id']}")
+        except NautobotError:
+            pass
+
+        # Delete the old IP object
+        try:
+            await client.rest_delete(f"ipam/ip-addresses/{old_id}")
+            changes.append(f"Deleted old IP {old_addr} (id: {old_id})")
+        except NautobotError as e:
+            changes.append(f"WARNING: Could not delete old IP {old_addr}: {e}")
+
+
+@mcp.tool()
 async def nautobot_create_vlan(
     vid: int,
     name: str,
