@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -45,6 +45,45 @@ def _check_itsm(cr_number: Optional[str]) -> Optional[str]:
                 "Provide a cr_number parameter with a valid ServiceNow Change Request number."
             )
     return None
+
+
+def _ensure_dict(value, field_name: str = "data") -> dict:
+    """Convert a value that may be a JSON string or already-parsed dict/list into a dict.
+
+    MCP protocol transmits tool arguments as JSON objects, so parameters typed as
+    'str' that contain JSON may arrive already deserialized (as dict/list) depending
+    on the MCP client implementation. This helper normalizes both cases.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        return {field_name: value}
+    # Must be a string — try to parse
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+        return {field_name: parsed}
+    except (json.JSONDecodeError, TypeError) as e:
+        raise ValueError(f"Invalid {field_name} JSON: {e}")
+
+
+def _ensure_parsed(value, field_name: str = "data"):
+    """Parse a JSON string or return the already-parsed value as-is.
+
+    Unlike _ensure_dict, this preserves the parsed type (list, dict, scalar).
+    Use for parameters that may be lists or other non-dict JSON.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (dict, list, int, float, bool)):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise ValueError(f"Invalid {field_name} JSON: {e}")
 
 
 def _gql_filters(**kwargs: Optional[str | int | bool]) -> str:
@@ -318,15 +357,15 @@ async def nautobot_get_cables(
 
 
 @mcp.tool()
-async def nautobot_graphql(query: str, variables: Optional[str] = None) -> str:
+async def nautobot_graphql(query: str, variables: Optional[str | dict] = None) -> str:
     """Execute an arbitrary GraphQL query against Nautobot. Read-only — Nautobot 3.1.0 has no GraphQL mutations."""
     logger.info(f"nautobot_graphql query_len={len(query)}")
     vars_dict = None
     if variables:
         try:
-            vars_dict = json.loads(variables)
-        except json.JSONDecodeError as e:
-            return json.dumps({"error": f"Invalid variables JSON: {e}"})
+            vars_dict = _ensure_dict(variables, "variables")
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
     try:
         data = await client.graphql(query, vars_dict)
     except NautobotError as e:
@@ -750,7 +789,7 @@ _OBJ_MAP = {
 async def nautobot_update_object(
     object_type: str,
     identifier: str,
-    updates: str,
+    updates: str | dict,
     cr_number: Optional[str] = None,
 ) -> str:
     """Update any Nautobot object via REST PATCH. Resolves by type+name. ITSM-gated.
@@ -773,9 +812,9 @@ async def nautobot_update_object(
     )
 
     try:
-        update_dict = json.loads(updates)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid updates JSON: {e}"})
+        update_dict = _ensure_dict(updates, "updates")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
     try:
         info = _OBJ_MAP[object_type]
@@ -849,7 +888,7 @@ def _first_list_from(data: dict) -> list:
 
 
 @mcp.tool()
-async def nautobot_reconcile(device_name: str, live_interfaces: str) -> str:
+async def nautobot_reconcile(device_name: str, live_interfaces: str | list) -> str:
     """Compare live device interfaces (from pyATS) against Nautobot source of truth.
 
     device_name: Device name in Nautobot
@@ -858,9 +897,9 @@ async def nautobot_reconcile(device_name: str, live_interfaces: str) -> str:
     logger.info(f"nautobot_reconcile device={device_name}")
 
     try:
-        live = json.loads(live_interfaces)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid live_interfaces JSON: {e}"})
+        live = _ensure_parsed(live_interfaces, "live_interfaces")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
     if not isinstance(live, list):
         return json.dumps({"error": "live_interfaces must be a JSON array"})
@@ -1228,7 +1267,7 @@ async def nautobot_create_graphql_query(
 @mcp.tool()
 async def nautobot_update_golden_config_setting(
     setting_id: str,
-    updates: str,
+    updates: str | dict,
     cr_number: Optional[str] = None,
 ) -> str:
     """Update a golden config setting — link repos, set path templates, assign SoT query. ITSM-gated.
@@ -1248,9 +1287,9 @@ async def nautobot_update_golden_config_setting(
         return json.dumps({"error": blocked})
     logger.info(f"nautobot_update_golden_config_setting id={setting_id} cr={cr_number}")
     try:
-        update_dict = json.loads(updates)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid updates JSON: {e}"})
+        update_dict = _ensure_dict(updates, "updates")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     try:
         old = await client.rest_get(f"plugins/golden-config/golden-config-settings/{setting_id}")
         result = await client.rest_patch(
@@ -1271,7 +1310,7 @@ async def nautobot_update_golden_config_setting(
 @mcp.tool()
 async def nautobot_run_job(
     job_id: str,
-    data: Optional[str] = None,
+    data: Optional[str | dict] = None,
     cr_number: Optional[str] = None,
 ) -> str:
     """Trigger a Nautobot job by its UUID. ITSM-gated.
@@ -1284,9 +1323,11 @@ async def nautobot_run_job(
         return json.dumps({"error": blocked})
     logger.info(f"nautobot_run_job job_id={job_id} cr={cr_number}")
     try:
-        payload: dict = {"data": json.loads(data) if data else {}}
+        payload: dict = {"data": _ensure_dict(data, "data")}
         result = await client.rest_post(f"extras/jobs/{job_id}/run", payload)
         return json.dumps({"triggered": True, "job_result": result}, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     except NautobotError as e:
         return json.dumps({"error": str(e)})
 
@@ -1403,7 +1444,7 @@ async def nautobot_sync_git_repository(
 @mcp.tool()
 async def nautobot_update_git_repository(
     repository_id: str,
-    updates: str,
+    updates: str | dict,
     cr_number: Optional[str] = None,
 ) -> str:
     """Update a git repository in Nautobot. ITSM-gated.
@@ -1421,9 +1462,9 @@ async def nautobot_update_git_repository(
         return json.dumps({"error": blocked})
     logger.info(f"nautobot_update_git_repository id={repository_id} cr={cr_number}")
     try:
-        update_dict = json.loads(updates)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid updates JSON: {e}"})
+        update_dict = _ensure_dict(updates, "updates")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     try:
         old = await client.rest_get(f"extras/git-repositories/{repository_id}")
         result = await client.rest_patch(f"extras/git-repositories/{repository_id}", update_dict)
@@ -1481,7 +1522,7 @@ async def nautobot_get_config_context_detail(config_context_id: str) -> str:
 @mcp.tool()
 async def nautobot_create_config_context(
     name: str,
-    data: str,
+    data: str | dict,
     roles: Optional[str] = None,
     locations: Optional[str] = None,
     platforms: Optional[str] = None,
@@ -1501,9 +1542,9 @@ async def nautobot_create_config_context(
         return json.dumps({"error": blocked})
     logger.info(f"nautobot_create_config_context name={name} cr={cr_number}")
     try:
-        ctx_data = json.loads(data)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid data JSON: {e}"})
+        ctx_data = _ensure_parsed(data, "data")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     try:
         payload: dict = {"name": name, "data": ctx_data}
         if description:
@@ -1532,7 +1573,7 @@ async def nautobot_create_config_context(
 @mcp.tool()
 async def nautobot_update_config_context(
     config_context_id: str,
-    updates: str,
+    updates: str | dict,
     cr_number: Optional[str] = None,
 ) -> str:
     """Update a config context in Nautobot. ITSM-gated.
@@ -1545,9 +1586,9 @@ async def nautobot_update_config_context(
         return json.dumps({"error": blocked})
     logger.info(f"nautobot_update_config_context id={config_context_id} cr={cr_number}")
     try:
-        update_dict = json.loads(updates)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid updates JSON: {e}"})
+        update_dict = _ensure_dict(updates, "updates")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     try:
         result = await client.rest_patch(f"extras/config-contexts/{config_context_id}", update_dict)
         return json.dumps({"updated": True, "config_context": result}, indent=2, default=str)
@@ -1580,7 +1621,7 @@ async def nautobot_get_dynamic_group_members(
 async def nautobot_create_secret(
     name: str,
     provider: str,
-    parameters: str,
+    parameters: str | dict,
     description: Optional[str] = None,
     cr_number: Optional[str] = None,
 ) -> str:
@@ -1599,9 +1640,9 @@ async def nautobot_create_secret(
         return json.dumps({"error": blocked})
     logger.info(f"nautobot_create_secret name={name} provider={provider} cr={cr_number}")
     try:
-        params = json.loads(parameters)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid parameters JSON: {e}"})
+        params = _ensure_dict(parameters, "parameters")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     try:
         payload: dict = {"name": name, "provider": provider, "parameters": params}
         if description:
@@ -2354,7 +2395,7 @@ async def _auto_resolve_fields(payload: dict, resolve_map: dict) -> dict:
 @mcp.tool()
 async def nautobot_create(
     object_type: str,
-    data: str,
+    data: str | dict,
     cr_number: Optional[str] = None,
 ) -> str:
     """Create any Nautobot object via REST API. Auto-resolves names to UUIDs. ITSM-gated.
@@ -2427,9 +2468,9 @@ async def nautobot_create(
         })
 
     try:
-        payload = json.loads(data)
-    except json.JSONDecodeError as e:
-        return json.dumps({"error": f"Invalid data JSON: {e}"})
+        payload = _ensure_dict(data, "data")
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
 
     reg = _OBJECT_REGISTRY[object_type]
 
