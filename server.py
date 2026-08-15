@@ -7,13 +7,13 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Optional
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from nautobot_client import NautobotClient, NautobotError, _esc
 from reconcile import reconcile_interfaces
-from cisco_design_reference import DESIGN_REFERENCE, get_reference, get_all_features, get_summary
+from cisco_design_reference import get_reference, get_all_features, get_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2935,8 +2935,8 @@ async def nautobot_create_bgp_peer_group(
             return json.dumps({"error": f"No BGP routing instance for device '{device}'"})
         instance_id = instances[0]["id"]
 
-        # Check if peer group exists
-        pg_resp = await client.get("/api/plugins/bgp/peer-groups/", params={"name": name})
+        # Check if peer group exists on this routing instance
+        pg_resp = await client.get("/api/plugins/bgp/peer-groups/", params={"name": name, "routing_instance": instance_id})
         if pg_resp.get("results"):
             return json.dumps({"success": True, "action": "already_exists", "name": name, "id": pg_resp["results"][0]["id"]})
 
