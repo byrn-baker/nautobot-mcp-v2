@@ -38,12 +38,11 @@ ITSM_LAB_MODE = os.environ.get("ITSM_LAB_MODE", "true").lower() == "true"
 
 def _check_itsm(cr_number: Optional[str]) -> Optional[str]:
     """Return error message if ITSM blocks the operation, else None."""
-    if ITSM_ENABLED and not ITSM_LAB_MODE:
-        if not cr_number:
-            return (
-                "Write operation blocked: ITSM is enabled. "
-                "Provide a cr_number parameter with a valid ServiceNow Change Request number."
-            )
+    if ITSM_ENABLED and not ITSM_LAB_MODE and not cr_number:
+        return (
+            "Write operation blocked: ITSM is enabled. "
+            "Provide a cr_number parameter with a valid ServiceNow Change Request number."
+        )
     return None
 
 
@@ -2852,7 +2851,6 @@ async def nautobot_create_interface(
             # Check if IP already exists
             ip_resp = await client.get("/api/ipam/ip-addresses/", params={"address": ip_address})
             if ip_resp.get("results"):
-                ip_id = ip_resp["results"][0]["id"]
                 ip_action = "ip_already_exists"
             else:
                 # Find or create prefix for the IP
