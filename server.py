@@ -755,6 +755,11 @@ async def nautobot_create_prefix(
 
 # ── Object type → REST endpoint + GraphQL lookup mapping ─────────────
 
+def _looks_like_uuid(value: str) -> bool:
+    """Cheap check for a UUID4-shaped string (36 chars, 4 dashes)."""
+    return len(value) == 36 and value.count("-") == 4
+
+
 _OBJ_MAP = {
     "device": {
         "endpoint": "dcim/devices",
@@ -781,6 +786,10 @@ _OBJ_MAP = {
         "endpoint": "dcim/cables",
         "lookup": None,  # identifier IS the UUID
     },
+    "vrf": {
+        "endpoint": "ipam/vrfs",
+        "lookup": '{{ vrfs(name: "{}") {{ id }} }}',
+    },
 }
 
 
@@ -793,9 +802,16 @@ async def nautobot_update_object(
 ) -> str:
     """Update any Nautobot object via REST PATCH. Resolves by type+name. ITSM-gated.
 
-    object_type: device, interface, ip_address, vlan, prefix, cable
-    identifier: device name, "device:interface", IP address, VLAN vid, prefix, or cable UUID
-    updates: JSON string of fields to update
+    object_type: device, interface, ip_address, vlan, prefix, cable, vrf
+    identifier: device name, "device:interface", IP address, VLAN vid, prefix,
+                cable UUID, or VRF name
+    updates: JSON string of fields to update. Many-to-many list fields
+             (import_targets, export_targets, devices, tags) accept
+             human-readable names and are resolved to UUIDs.
+
+    Note: assigning a VRF to a device is a separate relationship — use
+    nautobot_assign_vrf_to_device, not the interface 'vrf' field, since
+    Nautobot requires the VRF-device assignment to exist first.
     """
     blocked = _check_itsm(cr_number)
     if blocked:
@@ -856,6 +872,27 @@ async def nautobot_update_object(
                 except NautobotError:
                     pass  # leave as-is, let REST API validate
 
+        # Resolve many-to-many list fields whose entries are human-readable
+        # names to UUIDs. Entries that already look like UUIDs pass through.
+        _M2M_RESOLVERS = {
+            "import_targets": "route_target",
+            "export_targets": "route_target",
+            "devices": "device",
+            "tags": "tag",
+        }
+        for field, resolver in _M2M_RESOLVERS.items():
+            if field in update_dict and isinstance(update_dict[field], list):
+                resolved = []
+                for entry in update_dict[field]:
+                    if isinstance(entry, str) and not _looks_like_uuid(entry):
+                        try:
+                            resolved.append(await client.resolve_id(resolver, entry))
+                        except NautobotError:
+                            resolved.append(entry)  # let REST API validate
+                    else:
+                        resolved.append(entry)
+                update_dict[field] = resolved
+
         result = await client.rest_patch(f"{endpoint}/{obj_id}", update_dict)
 
         # Build change summary
@@ -868,6 +905,53 @@ async def nautobot_update_object(
 
         return json.dumps(
             {"updated": True, "object_type": object_type, "id": obj_id, "changes": changes},
+            indent=2,
+        )
+    except NautobotError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def nautobot_assign_vrf_to_device(
+    vrf: str,
+    device: str,
+    rd: Optional[str] = None,
+    cr_number: Optional[str] = None,
+) -> str:
+    """Assign a VRF to a device (Nautobot 2.x VRFDeviceAssignment). ITSM-gated.
+
+    In Nautobot 2.x a VRF must be assigned to a device before any of that
+    device's interfaces can be placed in the VRF. This creates that
+    assignment via ipam/vrf-device-assignments.
+
+    vrf: VRF name (e.g. 'CUST-A') or UUID
+    device: Device name (e.g. 'SPE2') or UUID
+    rd: Optional per-device route distinguisher for the assignment
+    """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
+
+    logger.info(f"nautobot_assign_vrf_to_device vrf={vrf} device={device} cr={cr_number}")
+
+    try:
+        vrf_id = vrf if _looks_like_uuid(vrf) else await client.resolve_id("vrf", vrf)
+        device_id = (
+            device if _looks_like_uuid(device) else await client.resolve_id("device", device)
+        )
+
+        payload: dict[str, Any] = {"vrf": vrf_id, "device": device_id}
+        if rd:
+            payload["rd"] = rd
+
+        result = await client.rest_post("ipam/vrf-device-assignments", payload)
+        return json.dumps(
+            {
+                "assigned": True,
+                "vrf": vrf,
+                "device": device,
+                "id": result.get("id"),
+            },
             indent=2,
         )
     except NautobotError as e:

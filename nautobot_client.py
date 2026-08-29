@@ -208,6 +208,7 @@ class NautobotClient:
             "provider": '{{ providers(name: "{}") {{ id }} }}'.format(_esc(name)),
             "circuit_type": '{{ circuit_types(name: "{}") {{ id }} }}'.format(_esc(name)),
             "tag": '{{ tags(name: "{}") {{ id }} }}'.format(_esc(name)),
+            "route_target": '{{ route_targets(name: "{}") {{ id }} }}'.format(_esc(name)),
         }
 
         if object_type == "namespace":
