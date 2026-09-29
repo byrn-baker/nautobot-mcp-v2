@@ -210,6 +210,7 @@ class NautobotClient:
             "tag": '{{ tags(name: "{}") {{ id }} }}'.format(_esc(name)),
             "route_target": '{{ route_targets(name: "{}") {{ id }} }}'.format(_esc(name)),
             "circuit": '{{ circuits(cid: "{}") {{ id }} }}'.format(_esc(name)),
+            "ip_address": '{{ ip_addresses(address: "{}") {{ id }} }}'.format(_esc(name)),
             "provider_network": '{{ provider_networks(name: "{}") {{ id }} }}'.format(_esc(name)),
             # BGP models plugin: ASN by number, routing instance by device name
             "bgp_routing_instance": '{{ bgp_routing_instances(device: "{}") {{ id }} }}'.format(_esc(name)),

@@ -802,9 +802,12 @@ async def nautobot_update_object(
 ) -> str:
     """Update any Nautobot object via REST PATCH. Resolves by type+name. ITSM-gated.
 
-    object_type: device, interface, ip_address, vlan, prefix, cable, vrf
-    identifier: device name, "device:interface", IP address, VLAN vid, prefix,
-                cable UUID, or VRF name
+    object_type: any type supported by nautobot_create (device, interface, vm_interface,
+                 virtual_machine, cluster, location, ip_address, vlan, prefix, cable, vrf, ...)
+    identifier: same rules as nautobot_delete — name for most types, "device:interface",
+                "vm:interface" for vm_interface, IP address, VLAN vid, prefix, ASN, or a UUID
+    Foreign keys (status, role, location, cluster, platform, tenant, ...) accept names;
+    primary_ip4/primary_ip6 accept an address like "10.0.0.5/24".
     updates: JSON string of fields to update. Many-to-many list fields
              (import_targets, export_targets, devices, tags) accept
              human-readable names and are resolved to UUIDs.
@@ -817,9 +820,9 @@ async def nautobot_update_object(
     if blocked:
         return json.dumps({"error": blocked})
 
-    if object_type not in _OBJ_MAP:
+    if object_type not in _OBJ_MAP and object_type not in _OBJECT_REGISTRY:
         return json.dumps(
-            {"error": f"Unknown object_type '{object_type}'. Valid: {list(_OBJ_MAP)}"}
+            {"error": f"Unknown object_type '{object_type}'. Valid: {sorted(set(_OBJ_MAP) | set(_OBJECT_REGISTRY))}"}
         )
 
     logger.info(
@@ -832,11 +835,18 @@ async def nautobot_update_object(
         return json.dumps({"error": str(e)})
 
     try:
-        info = _OBJ_MAP[object_type]
+        info = _OBJ_MAP.get(object_type) or {"endpoint": _OBJECT_REGISTRY[object_type]["endpoint"], "lookup": None}
         endpoint = info["endpoint"]
 
         # Resolve identifier to UUID
-        if object_type == "interface":
+        if _looks_like_uuid(identifier):
+            obj_id = identifier
+        elif object_type == "vlan" and not identifier.strip().isdigit():
+            return json.dumps({"error": f"VLAN identifier must be a numeric vid or UUID, got '{identifier}'"})
+        elif object_type not in _OBJ_MAP:
+            # All other types: same identifier rules as nautobot_delete
+            obj_id = await _resolve_identifier(object_type, identifier, _OBJECT_REGISTRY[object_type])
+        elif object_type == "interface":
             obj_id = await client.resolve_id("interface", identifier)
         elif object_type == "cable":
             obj_id = identifier  # already a UUID
@@ -871,6 +881,10 @@ async def nautobot_update_object(
                     )
                 except NautobotError:
                     pass  # leave as-is, let REST API validate
+
+        # Type-specific FK fields (e.g. cluster for VMs, primary_ip4 by address)
+        if object_type in _OBJECT_REGISTRY:
+            update_dict = await _auto_resolve_fields(update_dict, _OBJECT_REGISTRY[object_type]["resolve"])
 
         # Resolve many-to-many list fields whose entries are human-readable
         # names to UUIDs. Entries that already look like UUIDs pass through.
@@ -2034,6 +2048,9 @@ async def nautobot_create_virtual_machine(
     memory: Optional[int] = None,
     disk: Optional[int] = None,
     comments: Optional[str] = None,
+    platform: Optional[str] = None,
+    tenant: Optional[str] = None,
+    custom_fields: Optional[str | dict] = None,
     cr_number: Optional[str] = None,
 ) -> str:
     """Create a virtual machine in Nautobot. ITSM-gated.
@@ -2047,6 +2064,9 @@ async def nautobot_create_virtual_machine(
         memory: Memory in MB
         disk: Disk in GB
         comments: Free-text description
+        platform: Platform name (e.g., "Rocky Linux")
+        tenant: Tenant name
+        custom_fields: JSON object of custom field key -> value (e.g., {"app_id": "APP5927"})
         cr_number: ServiceNow change request number (required if ITSM enabled)
     """
     blocked = _check_itsm(cr_number)
@@ -2073,10 +2093,16 @@ async def nautobot_create_virtual_machine(
             payload["disk"] = disk
         if comments:
             payload["comments"] = comments
+        if platform:
+            payload["platform"] = await client.resolve_id("platform", platform)
+        if tenant:
+            payload["tenant"] = await client.resolve_id("tenant", tenant)
+        if custom_fields:
+            payload["custom_fields"] = _ensure_dict(custom_fields, "custom_fields")
 
         result = await client.rest_post("virtualization/virtual-machines", payload)
         return json.dumps({"created": True, "virtual_machine": result}, indent=2)
-    except NautobotError as e:
+    except (NautobotError, ValueError) as e:
         return json.dumps({"error": str(e)})
 
 
@@ -2141,7 +2167,7 @@ async def nautobot_assign_ip_to_vm(
         address: IP address in CIDR notation (e.g., "192.168.220.200/24")
         status: IP status (default: Active)
         namespace: IPAM namespace (default: Global)
-        set_primary: Set as the VM's primary IPv4 address
+        set_primary: Set as the VM's primary IP (primary_ip4 or primary_ip6, based on the address)
         cr_number: ServiceNow change request number
     """
     blocked = _check_itsm(cr_number)
@@ -2176,22 +2202,25 @@ async def nautobot_assign_ip_to_vm(
             {"ip_address": ip_id, "vm_interface": iface_id},
         )
 
-        # Set as primary IP if requested
+        # Set as primary IP if requested — primary_ip4 or primary_ip6 by address family
+        primary_field = None
         if set_primary:
+            import ipaddress as ipaddr
+            primary_field = "primary_ip6" if ipaddr.ip_interface(address).version == 6 else "primary_ip4"
             vm_query = f"""{{ virtual_machines(name: "{_esc(virtual_machine)}") {{ id }} }}"""
             vm_data = await client.graphql(vm_query)
             vms = vm_data.get("virtual_machines", [])
             if vms:
                 await client.rest_patch(
                     f"virtualization/virtual-machines/{vms[0]['id']}",
-                    {"primary_ip4": ip_id},
+                    {primary_field: ip_id},
                 )
 
         return json.dumps({
             "created": True,
             "ip_address": address,
             "assigned_to": f"{virtual_machine}:{interface}",
-            "primary": set_primary,
+            "primary": primary_field or False,
         }, indent=2)
     except NautobotError as e:
         return json.dumps({"error": str(e)})
@@ -2207,7 +2236,8 @@ _OBJECT_REGISTRY: dict[str, dict] = {
     "device": {
         "endpoint": "dcim/devices",
         "required": ["name", "device_type", "role", "location", "status"],
-        "resolve": {"device_type": "device_type", "role": "role", "location": "location", "status": "status", "platform": "platform", "tenant": "tenant"},
+        "resolve": {"device_type": "device_type", "role": "role", "location": "location", "status": "status", "platform": "platform", "tenant": "tenant",
+                    "primary_ip4": "ip_address", "primary_ip6": "ip_address"},
         "lookup": "devices",
         "lookup_field": "name",
     },
@@ -2401,9 +2431,16 @@ _OBJECT_REGISTRY: dict[str, dict] = {
     "virtual_machine": {
         "endpoint": "virtualization/virtual-machines",
         "required": ["name", "status", "cluster"],
-        "resolve": {"status": "status", "cluster": "cluster", "role": "role", "tenant": "tenant", "platform": "platform"},
+        "resolve": {"status": "status", "cluster": "cluster", "role": "role", "tenant": "tenant", "platform": "platform",
+                    "primary_ip4": "ip_address", "primary_ip6": "ip_address"},
         "lookup": "virtual_machines",
         "lookup_field": "name",
+    },
+    "vm_interface": {
+        "endpoint": "virtualization/interfaces",
+        "required": ["virtual_machine", "name", "status"],
+        "resolve": {"virtual_machine": "virtual_machine", "status": "status", "role": "role"},
+        "lookup": None,  # identifier "vm_name:interface_name"
     },
     # ── Extras ──
     "tag": {
@@ -2528,7 +2565,8 @@ async def nautobot_create(
         cluster_type (required: name)
         cluster_group (required: name)
         cluster (required: name, cluster_type)
-        virtual_machine (required: name, status, cluster)
+        virtual_machine (required: name, status, cluster) — optional: platform, role, tenant, custom_fields
+        vm_interface (required: virtual_machine, name, status)
       Extras:
         tag (required: name, content_types) — content_types: list like ["dcim.device"]
         role (required: name, content_types)
@@ -2642,6 +2680,18 @@ async def _resolve_identifier(object_type: str, identifier: str, reg: dict) -> s
     # Special cases
     if object_type == "interface":
         return await client.resolve_id("interface", identifier)
+
+    if object_type == "vm_interface":
+        if ":" not in identifier:
+            raise NautobotError("vm_interface identifier must be 'vm_name:interface_name' or a UUID")
+        vm, iface = identifier.split(":", 1)
+        data = await client.graphql(
+            f'{{ vm_interfaces(virtual_machine: "{_esc(vm)}", name: "{_esc(iface)}") {{ id }} }}'
+        )
+        items = _first_list_from(data)
+        if not items:
+            raise NautobotError(f"Interface '{iface}' on VM '{vm}' not found.")
+        return items[0]["id"]
 
     if object_type == "vlan":
         data = await client.graphql(f'{{ vlans(vid: {int(identifier)}) {{ id }} }}')

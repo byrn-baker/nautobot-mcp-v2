@@ -410,3 +410,60 @@ async def test_create_interface_is_idempotent(tools, api, seed):
     again = await tools.ok("nautobot_create_interface", device="mcpt-dev1", name=name, ip_address=f"{NET}.90.1/32")
     assert again["interface_action"] == "already_exists"
     assert again["ip_action"] == "ip_already_exists_already_assigned"
+
+
+# ── VM platform / custom fields / IPv6 primary / update_object on VMs ──
+
+
+async def test_vm_full_lifecycle(tools, api, seed):
+    vm = uid("vm-full")
+    await tools.ok("nautobot_create", object_type="prefix",
+                   data={"prefix": f"fd00:{RUN[:4]}::/64", "status": "Active", "namespace": "Global"})
+    await tools.ok("nautobot_create_virtual_machine", name=vm, cluster="mcpt-cluster", platform="Rocky Linux",
+                   tenant="mcpt-tenant", custom_fields={"app_id": "APP5927", "owner_team": "cdn"})
+    obj = await one(api, "virtualization/virtual-machines", name=vm)
+    assert obj["platform"]["name"] == "Rocky Linux" and obj["tenant"]["name"] == "mcpt-tenant"
+    assert obj["custom_fields"] == {"app_id": "APP5927", "owner_team": "cdn"}
+
+    await tools.ok("nautobot_create_vm_interface", virtual_machine=vm, name="eth0")
+    v4 = await tools.ok("nautobot_assign_ip_to_vm", virtual_machine=vm, interface="eth0", address=f"{NET}.100.5/24")
+    v6 = await tools.ok("nautobot_assign_ip_to_vm", virtual_machine=vm, interface="eth0", address=f"fd00:{RUN[:4]}::5/64")
+    assert v4["primary"] == "primary_ip4" and v6["primary"] == "primary_ip6"
+    obj = await one(api, "virtualization/virtual-machines", name=vm)
+    assert obj["primary_ip4"]["address"] == f"{NET}.100.5/24"
+    assert obj["primary_ip6"]["address"] == f"fd00:{RUN[:4]}::5/64"
+
+    # update_object on a VM: platform by name, custom field partial update, primary_ip6 by address
+    await tools.ok("nautobot_update_object", object_type="virtual_machine", identifier=vm,
+                   updates={"platform": "mcpt-ios", "custom_fields": {"app_id": "APP0001"}, "vcpus": 4})
+    obj = await one(api, "virtualization/virtual-machines", name=vm)
+    assert obj["platform"]["name"] == "mcpt-ios" and obj["vcpus"] == 4
+    assert obj["custom_fields"] == {"app_id": "APP0001", "owner_team": "cdn"}, "partial CF update wiped other fields"
+
+    # Existing IPv6 already on eth0 (the reported case): set it primary via update_object by address
+    await tools.ok("nautobot_update_object", object_type="virtual_machine", identifier=vm, updates={"primary_ip6": None})
+    assert (await one(api, "virtualization/virtual-machines", name=vm))["primary_ip6"] is None
+    await tools.ok("nautobot_update_object", object_type="virtual_machine", identifier=vm,
+                   updates={"primary_ip6": f"fd00:{RUN[:4]}::5/64"})
+    assert (await one(api, "virtualization/virtual-machines", name=vm))["primary_ip6"]["address"] == f"fd00:{RUN[:4]}::5/64"
+
+    # update_object on a VM interface, "vm:interface" identifier
+    await tools.ok("nautobot_update_object", object_type="vm_interface", identifier=f"{vm}:eth0",
+                   updates={"description": "u", "mtu": 9000})
+    iface = await one(api, "virtualization/interfaces", virtual_machine=vm, name="eth0")
+    assert iface["description"] == "u" and iface["mtu"] == 9000
+
+
+async def test_update_object_every_registry_type_resolves(tools, api, seed):
+    """Every nautobot_create type is accepted by update_object (no 'Unknown object_type')."""
+    import server
+    for t in server._OBJECT_REGISTRY:
+        out = await tools("nautobot_update_object", object_type=t, identifier="00000000-0000-0000-0000-000000000000",
+                          updates={"description": "x"})
+        assert "Unknown object_type" not in out.get("error", ""), t
+
+
+async def test_vm_create_bad_custom_fields_json(tools, seed):
+    out = await tools("nautobot_create_virtual_machine", name=uid("vm-bad"), cluster="mcpt-cluster",
+                      custom_fields="{not json")
+    assert "Invalid custom_fields JSON" in out["error"]

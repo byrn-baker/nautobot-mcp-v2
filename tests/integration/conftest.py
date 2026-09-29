@@ -134,6 +134,18 @@ async def seed(api):
         api, "ipam/prefixes", {"prefix": f"{NET}.0.0/16"},
         {"prefix": f"{NET}.0.0/16", "status": s["status"]["id"], "namespace": s["namespace"]["id"], "type": "container"},
     )
+    s["platform_rocky"] = await _get_or_create(api, "dcim/platforms", {"name": "Rocky Linux"}, {"name": "Rocky Linux"})
+    s["tenant"] = await _get_or_create(api, "tenancy/tenants", {"name": "mcpt-tenant"}, {"name": "mcpt-tenant"})
+    # A select-type app_id custom field, plus a text field to check partial updates.
+    vm_ct = ["virtualization.virtualmachine", "dcim.device"]
+    # extras/custom-fields has no ?key= filter; ?label= works.
+    cf = await _get_or_create(api, "extras/custom-fields", {"label": "app_id"},
+                              {"key": "app_id", "label": "app_id", "type": "select", "content_types": vm_ct})
+    for v in ("APP5927", "APP0001"):
+        await _get_or_create(api, "extras/custom-field-choices", {"custom_field": cf["id"], "value": v},
+                             {"custom_field": cf["id"], "value": v})
+    await _get_or_create(api, "extras/custom-fields", {"label": "owner_team"},
+                         {"key": "owner_team", "label": "owner_team", "type": "text", "content_types": vm_ct})
     s["asn"] = await _get_or_create(
         api, "plugins/bgp/autonomous-systems", {"asn": 64512}, {"asn": 64512, "status": s["status"]["id"]},
     )
