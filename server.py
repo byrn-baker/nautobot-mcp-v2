@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -802,9 +802,12 @@ async def nautobot_update_object(
 ) -> str:
     """Update any Nautobot object via REST PATCH. Resolves by type+name. ITSM-gated.
 
-    object_type: device, interface, ip_address, vlan, prefix, cable, vrf
-    identifier: device name, "device:interface", IP address, VLAN vid, prefix,
-                cable UUID, or VRF name
+    object_type: any type supported by nautobot_create (device, interface, vm_interface,
+                 virtual_machine, cluster, location, ip_address, vlan, prefix, cable, vrf, ...)
+    identifier: same rules as nautobot_delete — name for most types, "device:interface",
+                "vm:interface" for vm_interface, IP address, VLAN vid, prefix, ASN, or a UUID
+    Foreign keys (status, role, location, cluster, platform, tenant, ...) accept names;
+    primary_ip4/primary_ip6 accept an address like "10.0.0.5/24".
     updates: JSON string of fields to update. Many-to-many list fields
              (import_targets, export_targets, devices, tags) accept
              human-readable names and are resolved to UUIDs.
@@ -817,9 +820,9 @@ async def nautobot_update_object(
     if blocked:
         return json.dumps({"error": blocked})
 
-    if object_type not in _OBJ_MAP:
+    if object_type not in _OBJ_MAP and object_type not in _OBJECT_REGISTRY:
         return json.dumps(
-            {"error": f"Unknown object_type '{object_type}'. Valid: {list(_OBJ_MAP)}"}
+            {"error": f"Unknown object_type '{object_type}'. Valid: {sorted(set(_OBJ_MAP) | set(_OBJECT_REGISTRY))}"}
         )
 
     logger.info(
@@ -832,11 +835,18 @@ async def nautobot_update_object(
         return json.dumps({"error": str(e)})
 
     try:
-        info = _OBJ_MAP[object_type]
+        info = _OBJ_MAP.get(object_type) or {"endpoint": _OBJECT_REGISTRY[object_type]["endpoint"], "lookup": None}
         endpoint = info["endpoint"]
 
         # Resolve identifier to UUID
-        if object_type == "interface":
+        if _looks_like_uuid(identifier):
+            obj_id = identifier
+        elif object_type == "vlan" and not identifier.strip().isdigit():
+            return json.dumps({"error": f"VLAN identifier must be a numeric vid or UUID, got '{identifier}'"})
+        elif object_type not in _OBJ_MAP:
+            # All other types: same identifier rules as nautobot_delete
+            obj_id = await _resolve_identifier(object_type, identifier, _OBJECT_REGISTRY[object_type])
+        elif object_type == "interface":
             obj_id = await client.resolve_id("interface", identifier)
         elif object_type == "cable":
             obj_id = identifier  # already a UUID
@@ -871,6 +881,10 @@ async def nautobot_update_object(
                     )
                 except NautobotError:
                     pass  # leave as-is, let REST API validate
+
+        # Type-specific FK fields (e.g. cluster for VMs, primary_ip4 by address)
+        if object_type in _OBJECT_REGISTRY:
+            update_dict = await _auto_resolve_fields(update_dict, _OBJECT_REGISTRY[object_type]["resolve"])
 
         # Resolve many-to-many list fields whose entries are human-readable
         # names to UUIDs. Entries that already look like UUIDs pass through.
@@ -1460,13 +1474,17 @@ async def nautobot_enable_job(
     job_id: Optional[str] = None,
     enable_all: bool = False,
     enabled: bool = True,
+    cr_number: Optional[str] = None,
 ) -> str:
-    """Enable or disable Nautobot jobs.
+    """Enable or disable Nautobot jobs. ITSM-gated.
 
     job_id: UUID of a single job to enable/disable (get from nautobot_list_jobs)
     enable_all: If True, enables ALL disabled jobs in one call. Ignores job_id.
     enabled: True to enable, False to disable (default: True)
     """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
     logger.info(f"nautobot_enable_job id={job_id} enable_all={enable_all} enabled={enabled}")
     try:
         if enable_all:
@@ -2030,6 +2048,9 @@ async def nautobot_create_virtual_machine(
     memory: Optional[int] = None,
     disk: Optional[int] = None,
     comments: Optional[str] = None,
+    platform: Optional[str] = None,
+    tenant: Optional[str] = None,
+    custom_fields: Optional[str | dict] = None,
     cr_number: Optional[str] = None,
 ) -> str:
     """Create a virtual machine in Nautobot. ITSM-gated.
@@ -2043,6 +2064,9 @@ async def nautobot_create_virtual_machine(
         memory: Memory in MB
         disk: Disk in GB
         comments: Free-text description
+        platform: Platform name (e.g., "Rocky Linux")
+        tenant: Tenant name
+        custom_fields: JSON object of custom field key -> value (e.g., {"app_id": "APP5927"})
         cr_number: ServiceNow change request number (required if ITSM enabled)
     """
     blocked = _check_itsm(cr_number)
@@ -2069,10 +2093,16 @@ async def nautobot_create_virtual_machine(
             payload["disk"] = disk
         if comments:
             payload["comments"] = comments
+        if platform:
+            payload["platform"] = await client.resolve_id("platform", platform)
+        if tenant:
+            payload["tenant"] = await client.resolve_id("tenant", tenant)
+        if custom_fields:
+            payload["custom_fields"] = _ensure_dict(custom_fields, "custom_fields")
 
         result = await client.rest_post("virtualization/virtual-machines", payload)
         return json.dumps({"created": True, "virtual_machine": result}, indent=2)
-    except NautobotError as e:
+    except (NautobotError, ValueError) as e:
         return json.dumps({"error": str(e)})
 
 
@@ -2082,6 +2112,7 @@ async def nautobot_create_vm_interface(
     name: str,
     enabled: bool = True,
     description: Optional[str] = None,
+    status: str = "Active",
     cr_number: Optional[str] = None,
 ) -> str:
     """Create a network interface on a virtual machine. ITSM-gated.
@@ -2091,6 +2122,7 @@ async def nautobot_create_vm_interface(
         name: Interface name (e.g., "eth0")
         enabled: Whether the interface is enabled
         description: Interface description
+        status: Interface status name (default: Active; required by Nautobot 2.x/3.x)
         cr_number: ServiceNow change request number
     """
     blocked = _check_itsm(cr_number)
@@ -2100,11 +2132,13 @@ async def nautobot_create_vm_interface(
     logger.info(f"nautobot_create_vm_interface {virtual_machine}:{name} cr={cr_number}")
     try:
         vm_id = await client.resolve_id("virtual_machine", virtual_machine)
+        status_id = await client.resolve_id("status", status)
 
         payload: dict = {
             "virtual_machine": vm_id,
             "name": name,
             "enabled": enabled,
+            "status": status_id,
         }
         if description:
             payload["description"] = description
@@ -2133,7 +2167,7 @@ async def nautobot_assign_ip_to_vm(
         address: IP address in CIDR notation (e.g., "192.168.220.200/24")
         status: IP status (default: Active)
         namespace: IPAM namespace (default: Global)
-        set_primary: Set as the VM's primary IPv4 address
+        set_primary: Set as the VM's primary IP (primary_ip4 or primary_ip6, based on the address)
         cr_number: ServiceNow change request number
     """
     blocked = _check_itsm(cr_number)
@@ -2145,6 +2179,14 @@ async def nautobot_assign_ip_to_vm(
         status_id = await client.resolve_id("status", status)
         ns_id = await client.resolve_id("namespace", namespace)
 
+        # Resolve the VM interface first so a bad name doesn't leave an orphan IP behind.
+        query = f"""{{ vm_interfaces(virtual_machine: "{_esc(virtual_machine)}", name: "{_esc(interface)}") {{ id }} }}"""
+        data = await client.graphql(query)
+        ifaces = data.get("vm_interfaces", [])
+        if not ifaces:
+            return json.dumps({"error": f"VM interface {virtual_machine}:{interface} not found"})
+        iface_id = ifaces[0]["id"]
+
         # Create the IP address
         ip_payload: dict = {
             "address": address,
@@ -2154,37 +2196,31 @@ async def nautobot_assign_ip_to_vm(
         ip_result = await client.rest_post("ipam/ip-addresses", ip_payload)
         ip_id = ip_result["id"]
 
-        # Resolve VM interface
-        # Query for the VM interface by VM name + interface name
-        query = f"""{{ vm_interfaces(virtual_machine: "{_esc(virtual_machine)}", name: "{_esc(interface)}") {{ id }} }}"""
-        data = await client.graphql(query)
-        ifaces = data.get("vm_interfaces", [])
-        if not ifaces:
-            return json.dumps({"error": f"VM interface {virtual_machine}:{interface} not found"})
-        iface_id = ifaces[0]["id"]
-
         # Assign IP to VM interface
         await client.rest_post(
             "ipam/ip-address-to-interface",
             {"ip_address": ip_id, "vm_interface": iface_id},
         )
 
-        # Set as primary IP if requested
+        # Set as primary IP if requested — primary_ip4 or primary_ip6 by address family
+        primary_field = None
         if set_primary:
+            import ipaddress as ipaddr
+            primary_field = "primary_ip6" if ipaddr.ip_interface(address).version == 6 else "primary_ip4"
             vm_query = f"""{{ virtual_machines(name: "{_esc(virtual_machine)}") {{ id }} }}"""
             vm_data = await client.graphql(vm_query)
             vms = vm_data.get("virtual_machines", [])
             if vms:
                 await client.rest_patch(
                     f"virtualization/virtual-machines/{vms[0]['id']}",
-                    {"primary_ip4": ip_id},
+                    {primary_field: ip_id},
                 )
 
         return json.dumps({
             "created": True,
             "ip_address": address,
             "assigned_to": f"{virtual_machine}:{interface}",
-            "primary": set_primary,
+            "primary": primary_field or False,
         }, indent=2)
     except NautobotError as e:
         return json.dumps({"error": str(e)})
@@ -2200,7 +2236,8 @@ _OBJECT_REGISTRY: dict[str, dict] = {
     "device": {
         "endpoint": "dcim/devices",
         "required": ["name", "device_type", "role", "location", "status"],
-        "resolve": {"device_type": "device_type", "role": "role", "location": "location", "status": "status", "platform": "platform", "tenant": "tenant"},
+        "resolve": {"device_type": "device_type", "role": "role", "location": "location", "status": "status", "platform": "platform", "tenant": "tenant",
+                    "primary_ip4": "ip_address", "primary_ip6": "ip_address"},
         "lookup": "devices",
         "lookup_field": "name",
     },
@@ -2291,7 +2328,7 @@ _OBJECT_REGISTRY: dict[str, dict] = {
     },
     "vrf": {
         "endpoint": "ipam/vrfs",
-        "required": ["name", "rd"],
+        "required": ["name"],
         "resolve": {"namespace": "namespace", "tenant": "tenant"},
         "lookup": "vrfs",
         "lookup_field": "name",
@@ -2345,7 +2382,7 @@ _OBJECT_REGISTRY: dict[str, dict] = {
     "circuit_termination": {
         "endpoint": "circuits/circuit-terminations",
         "required": ["term_side", "circuit"],
-        "resolve": {"location": "location"},
+        "resolve": {"location": "location", "circuit": "circuit", "provider_network": "provider_network"},
         "lookup": None,
     },
     "provider_network": {
@@ -2394,9 +2431,16 @@ _OBJECT_REGISTRY: dict[str, dict] = {
     "virtual_machine": {
         "endpoint": "virtualization/virtual-machines",
         "required": ["name", "status", "cluster"],
-        "resolve": {"status": "status", "cluster": "cluster", "role": "role", "tenant": "tenant", "platform": "platform"},
+        "resolve": {"status": "status", "cluster": "cluster", "role": "role", "tenant": "tenant", "platform": "platform",
+                    "primary_ip4": "ip_address", "primary_ip6": "ip_address"},
         "lookup": "virtual_machines",
         "lookup_field": "name",
+    },
+    "vm_interface": {
+        "endpoint": "virtualization/interfaces",
+        "required": ["virtual_machine", "name", "status"],
+        "resolve": {"virtual_machine": "virtual_machine", "status": "status", "role": "role"},
+        "lookup": None,  # identifier "vm_name:interface_name"
     },
     # ── Extras ──
     "tag": {
@@ -2437,13 +2481,13 @@ _OBJECT_REGISTRY: dict[str, dict] = {
     "bgp_routing_instance": {
         "endpoint": "plugins/bgp/routing-instances",
         "required": ["device", "autonomous_system"],
-        "resolve": {"device": "device", "status": "status"},
+        "resolve": {"device": "device", "status": "status", "autonomous_system": "autonomous_system"},
         "lookup": None,
     },
     "bgp_peer_group": {
         "endpoint": "plugins/bgp/peer-groups",
         "required": ["name", "routing_instance"],
-        "resolve": {},
+        "resolve": {"routing_instance": "bgp_routing_instance", "autonomous_system": "autonomous_system"},
         "lookup": None,
     },
     "bgp_peering": {
@@ -2467,9 +2511,13 @@ async def _auto_resolve_fields(payload: dict, resolve_map: dict) -> dict:
     """Resolve string names to UUIDs for foreign key fields."""
     resolved = dict(payload)
     for field, resolve_type in resolve_map.items():
-        if field in resolved and isinstance(resolved[field], str):
+        value = resolved.get(field)
+        # ASNs are commonly passed as integers; everything else by name.
+        if isinstance(value, int) and not isinstance(value, bool) and resolve_type == "autonomous_system":
+            value = str(value)
+        if isinstance(value, str) and not _looks_like_uuid(value):
             try:
-                resolved[field] = await client.resolve_id(resolve_type, resolved[field])
+                resolved[field] = await client.resolve_id(resolve_type, value)
             except NautobotError:
                 pass  # leave as-is, let REST API validate
     return resolved
@@ -2499,7 +2547,7 @@ async def nautobot_create(
         ip_address (required: address, status, namespace) — use nautobot_create_ip_address for interface assignment
         prefix (required: prefix, status, namespace)
         vlan (required: vid, name, status)
-        vrf (required: name, rd) — optional: namespace, tenant
+        vrf (required: name) — optional: rd, namespace, tenant
         namespace (required: name)
         vlan_group (required: name)
         route_target (required: name)
@@ -2517,17 +2565,19 @@ async def nautobot_create(
         cluster_type (required: name)
         cluster_group (required: name)
         cluster (required: name, cluster_type)
-        virtual_machine (required: name, status, cluster)
+        virtual_machine (required: name, status, cluster) — optional: platform, role, tenant, custom_fields
+        vm_interface (required: virtual_machine, name, status)
       Extras:
         tag (required: name, content_types) — content_types: list like ["dcim.device"]
         role (required: name, content_types)
         status (required: name, content_types)
         contact (required: name)
       BGP Plugin:
-        autonomous_system (required: asn)
-        bgp_routing_instance (required: device, autonomous_system)
-        bgp_peer_group (required: name, routing_instance)
+        autonomous_system (required: asn) — optional: status
+        bgp_routing_instance (required: device, autonomous_system) — autonomous_system may be the ASN number
+        bgp_peer_group (required: name, routing_instance) — routing_instance may be the device name
         bgp_peering (required: none — optional: status)
+      Note: ip_address needs an existing parent prefix in its namespace.
 
     data — JSON string of fields. Foreign key fields (status, role, location, device, platform,
            tenant, manufacturer, device_type, cluster, cluster_type, namespace, vlan_group,
@@ -2630,6 +2680,18 @@ async def _resolve_identifier(object_type: str, identifier: str, reg: dict) -> s
     # Special cases
     if object_type == "interface":
         return await client.resolve_id("interface", identifier)
+
+    if object_type == "vm_interface":
+        if ":" not in identifier:
+            raise NautobotError("vm_interface identifier must be 'vm_name:interface_name' or a UUID")
+        vm, iface = identifier.split(":", 1)
+        data = await client.graphql(
+            f'{{ vm_interfaces(virtual_machine: "{_esc(vm)}", name: "{_esc(iface)}") {{ id }} }}'
+        )
+        items = _first_list_from(data)
+        if not items:
+            raise NautobotError(f"Interface '{iface}' on VM '{vm}' not found.")
+        return items[0]["id"]
 
     if object_type == "vlan":
         data = await client.graphql(f'{{ vlans(vid: {int(identifier)}) {{ id }} }}')
@@ -2758,6 +2820,18 @@ async def nautobot_get_device_config_context(
         return json.dumps({"error": str(e)})
 
 
+_BGP_AFI_CACHE: dict[str, set] = {}
+
+
+async def _bgp_afi_choices(endpoint: str) -> set:
+    """Valid afi_safi values for a BGP plugin endpoint (from the REST OPTIONS schema)."""
+    if endpoint not in _BGP_AFI_CACHE:
+        resp = await client.http.request("OPTIONS", f"{client.url}/api/plugins/bgp/{endpoint}/")
+        post = resp.json().get("actions", {}).get("POST", {}) if resp.status_code == 200 else {}
+        _BGP_AFI_CACHE[endpoint] = {c["value"] for c in post.get("afi_safi", {}).get("choices", [])}
+    return _BGP_AFI_CACHE[endpoint]
+
+
 @mcp.tool()
 async def nautobot_create_bgp_peering(
     device: str,
@@ -2768,11 +2842,14 @@ async def nautobot_create_bgp_peering(
     local_asn: Optional[int] = None,
     description: Optional[str] = None,
     address_families: Optional[str] = None,
+    cr_number: Optional[str] = None,
 ) -> str:
-    """Create a complete BGP peering in Nautobot in one call.
+    """Create a complete BGP peering in Nautobot in one call. ITSM-gated.
 
     Creates the peering object with both endpoints (local and remote),
-    optionally linking to a peer group and adding address families.
+    optionally linking to a peer group and adding address families to the
+    local endpoint. Both IPs must already exist in Nautobot. If any step fails,
+    the partially created peering is removed.
 
     Args:
         device: Local device name (e.g. 'RR1')
@@ -2784,6 +2861,9 @@ async def nautobot_create_bgp_peering(
         description: Optional peering description
         address_families: Comma-separated AFI/SAFI (e.g. 'ipv4_unicast,ipv6_unicast'). Default: ipv4_unicast
     """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
     logger.info(f"nautobot_create_bgp_peering device={device} local={local_ip} peer={peer_ip} as={peer_asn}")
     afis = (address_families or "ipv4_unicast").split(",")
     try:
@@ -2795,15 +2875,24 @@ async def nautobot_create_bgp_peering(
             return json.dumps({"error": f"No BGP routing instance found for device '{device}'"})
         instance_id = instances[0]["id"]
 
-        # Find peer group if specified
+        status_id = await client.resolve_id("status", "Active")
+
+        # Find peer group if specified (scoped to this device's routing instance)
         peer_group_id = None
         if peer_group:
-            pg_gql = f"""{{ bgp_peer_groups {{ id name }} }}"""
-            pg_data = await client.graphql(pg_gql)
-            for pg in pg_data.get("bgp_peer_groups", []):
-                if pg["name"] == peer_group:
-                    peer_group_id = pg["id"]
-                    break
+            pg_resp = await client.get(
+                "/api/plugins/bgp/peer-groups/",
+                params={"name": peer_group, "routing_instance": instance_id},
+            )
+            if not pg_resp.get("results"):
+                return json.dumps({"error": f"Peer group '{peer_group}' not found on device '{device}'"})
+            peer_group_id = pg_resp["results"][0]["id"]
+
+        # Validate address families before creating anything
+        valid_afis = await _bgp_afi_choices("peer-endpoint-address-families")
+        bad = [a.strip() for a in afis if a.strip() not in valid_afis]
+        if valid_afis and bad:
+            return json.dumps({"error": f"Invalid address_families {bad}. Valid: {sorted(valid_afis)}"})
 
         # Find or create the peer ASN
         asn_resp = await client.get("/api/plugins/bgp/autonomous-systems/", params={"asn": peer_asn})
@@ -2812,7 +2901,7 @@ async def nautobot_create_bgp_peering(
             peer_asn_id = asn_results[0]["id"]
         else:
             asn_create = await client.post("/api/plugins/bgp/autonomous-systems/", json={
-                "asn": peer_asn, "status": "active",
+                "asn": peer_asn, "status": status_id,
                 "description": f"AS {peer_asn}"
             })
             peer_asn_id = asn_create["id"]
@@ -2827,45 +2916,45 @@ async def nautobot_create_bgp_peering(
         if not local_ip_id:
             return json.dumps({"error": f"Local IP {local_ip} not found in Nautobot. Create the interface and IP first."})
 
-        # Create the peering
-        peering_payload = {"status": "active"}
-        if description:
-            peering_payload["description"] = description
-        peering = await client.post("/api/plugins/bgp/peerings/", json=peering_payload)
+        if not peer_ip_id:
+            return json.dumps({"error": f"Peer IP {peer_ip} not found in Nautobot. Create it first (e.g. nautobot_create_ip_address)."})
+
+        # Create the peering (the Peering model only has a status; description goes on the local endpoint)
+        peering = await client.post("/api/plugins/bgp/peerings/", json={"status": status_id})
         peering_id = peering["id"]
 
-        # Create endpoint A (local device)
-        ep_a_payload = {
-            "peering": peering_id,
-            "routing_instance": instance_id,
-            "source_ip": local_ip_id,
-            "enabled": True,
-        }
-        if peer_group_id:
-            ep_a_payload["peer_group"] = peer_group_id
-        await client.post("/api/plugins/bgp/peer-endpoints/", json=ep_a_payload)
+        try:
+            # Create endpoint A (local device)
+            ep_a_payload = {
+                "peering": peering_id,
+                "routing_instance": instance_id,
+                "source_ip": local_ip_id,
+                "enabled": True,
+            }
+            if peer_group_id:
+                ep_a_payload["peer_group"] = peer_group_id
+            if description:
+                ep_a_payload["description"] = description
+            ep_a = await client.post("/api/plugins/bgp/peer-endpoints/", json=ep_a_payload)
 
-        # Create endpoint B (remote peer)
-        ep_b_payload = {
-            "peering": peering_id,
-            "autonomous_system": peer_asn_id,
-            "enabled": True,
-        }
-        if peer_ip_id:
-            ep_b_payload["source_ip"] = peer_ip_id
-        await client.post("/api/plugins/bgp/peer-endpoints/", json=ep_b_payload)
+            # Create endpoint B (remote peer)
+            await client.post("/api/plugins/bgp/peer-endpoints/", json={
+                "peering": peering_id,
+                "autonomous_system": peer_asn_id,
+                "source_ip": peer_ip_id,
+                "enabled": True,
+            })
 
-        # Add address families to the peer group if specified
-        if peer_group_id and afis:
+            # Address families belong to the local peer endpoint
             for afi in afis:
-                try:
-                    await client.post("/api/plugins/bgp/address-families/", json={
-                        "routing_instance": instance_id,
-                        "peer_group": peer_group_id,
-                        "afi_safi": afi.strip(),
-                    })
-                except Exception:
-                    pass  # May already exist
+                await client.post("/api/plugins/bgp/peer-endpoint-address-families/", json={
+                    "peer_endpoint": ep_a["id"],
+                    "afi_safi": afi.strip(),
+                })
+        except NautobotError:
+            # Don't leave a half-built peering behind (endpoints cascade with the peering)
+            await client.rest_delete(f"plugins/bgp/peerings/{peering_id}")
+            raise
 
         return json.dumps({
             "success": True,
@@ -2889,17 +2978,24 @@ async def nautobot_create_interface(
     ip_address: Optional[str] = None,
     description: Optional[str] = None,
     enabled: bool = True,
+    namespace: str = "Global",
+    cr_number: Optional[str] = None,
 ) -> str:
-    """Create an interface on a device with optional IP assignment in one call.
+    """Create an interface on a device with optional IP assignment in one call. ITSM-gated.
 
     Args:
         device: Device name (e.g. 'RR1')
         name: Interface name (e.g. 'Tunnel0', 'Loopback99')
         interface_type: Interface type (virtual, lag, bridge, 1000base-t, etc.)
-        ip_address: Optional IP with prefix (e.g. '10.255.255.2/30') — creates and assigns
+        ip_address: Optional IP with prefix (e.g. '10.255.255.2/30'). Created if missing (its parent
+            prefix must already exist in the namespace), then assigned to the interface.
         description: Optional interface description
         enabled: Whether interface is enabled (default True)
+        namespace: IPAM namespace for the IP (default Global)
     """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
     logger.info(f"nautobot_create_interface device={device} name={name} ip={ip_address}")
     try:
         # Find device
@@ -2909,8 +3005,10 @@ async def nautobot_create_interface(
             return json.dumps({"error": f"Device '{device}' not found"})
         device_id = devices[0]["id"]
 
+        status_id = await client.resolve_id("status", "Active")
+
         # Check if interface already exists
-        iface_resp = await client.get("/api/dcim/interfaces/", params={"device": device, "name": name})
+        iface_resp = await client.get("/api/dcim/interfaces/", params={"device_id": device_id, "name": name})
         if iface_resp.get("results"):
             iface_id = iface_resp["results"][0]["id"]
             action = "already_exists"
@@ -2921,7 +3019,7 @@ async def nautobot_create_interface(
                 "name": name,
                 "type": interface_type,
                 "enabled": enabled,
-                "status": "active",
+                "status": status_id,
             }
             if description:
                 iface_payload["description"] = description
@@ -2932,22 +3030,30 @@ async def nautobot_create_interface(
         # Assign IP if provided
         ip_action = None
         if ip_address:
-            # Check if IP already exists
-            ip_resp = await client.get("/api/ipam/ip-addresses/", params={"address": ip_address})
+            ip_resp = await client.get("/api/ipam/ip-addresses/", params={"address": ip_address, "namespace": namespace})
             if ip_resp.get("results"):
+                ip_id = ip_resp["results"][0]["id"]
                 ip_action = "ip_already_exists"
             else:
-                # Find or create prefix for the IP
                 ip_payload = {
                     "address": ip_address,
-                    "status": "active",
-                    "assigned_object_type": "dcim.interface",
-                    "assigned_object_id": iface_id,
+                    "status": status_id,
+                    "namespace": await client.resolve_id("namespace", namespace),
                 }
                 if description:
                     ip_payload["description"] = description
-                await client.post("/api/ipam/ip-addresses/", json=ip_payload)
-                ip_action = "ip_created_and_assigned"
+                ip_id = (await client.post("/api/ipam/ip-addresses/", json=ip_payload))["id"]
+                ip_action = "ip_created"
+
+            # Nautobot 2.x/3.x: IP-to-interface is an M2M assignment
+            existing = await client.rest_get(
+                "ipam/ip-address-to-interface", {"ip_address": ip_id, "interface": iface_id}
+            )
+            if not existing.get("results"):
+                await client.rest_post("ipam/ip-address-to-interface", {"ip_address": ip_id, "interface": iface_id})
+                ip_action += "_and_assigned"
+            else:
+                ip_action += "_already_assigned"
 
         return json.dumps({
             "success": True,
@@ -2965,13 +3071,19 @@ async def nautobot_create_interface(
 async def nautobot_create_autonomous_system(
     asn: int,
     description: Optional[str] = None,
+    status: str = "Active",
+    cr_number: Optional[str] = None,
 ) -> str:
-    """Create an autonomous system in Nautobot BGP models.
+    """Create an autonomous system in Nautobot BGP models. ITSM-gated.
 
     Args:
         asn: AS number (e.g. 65099)
         description: Optional description (e.g. 'NetClaw Protocol Agent')
+        status: Status name (default Active)
     """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
     logger.info(f"nautobot_create_autonomous_system asn={asn}")
     try:
         # Check if it already exists
@@ -2979,7 +3091,7 @@ async def nautobot_create_autonomous_system(
         if resp.get("results"):
             return json.dumps({"success": True, "action": "already_exists", "asn": asn, "id": resp["results"][0]["id"]})
 
-        payload = {"asn": asn, "status": "active"}
+        payload = {"asn": asn, "status": await client.resolve_id("status", status)}
         if description:
             payload["description"] = description
         result = await client.post("/api/plugins/bgp/autonomous-systems/", json=payload)
@@ -2996,17 +3108,21 @@ async def nautobot_create_bgp_peer_group(
     source_interface: Optional[str] = None,
     description: Optional[str] = None,
     address_families: Optional[str] = None,
+    cr_number: Optional[str] = None,
 ) -> str:
-    """Create a BGP peer group on a device's routing instance.
+    """Create a BGP peer group on a device's routing instance. ITSM-gated.
 
     Args:
         name: Peer group name (e.g. 'NETCLAW-PEERS')
         device: Device name (e.g. 'RR1')
-        remote_asn: Optional remote AS for the group
-        source_interface: Optional update-source interface name
+        remote_asn: Optional remote AS for the group (must already exist)
+        source_interface: Optional update-source interface name (must exist on the device)
         description: Optional description
         address_families: Comma-separated AFI/SAFI (e.g. 'ipv4_unicast')
     """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
     logger.info(f"nautobot_create_bgp_peer_group name={name} device={device}")
     try:
         # Find routing instance
@@ -3023,39 +3139,48 @@ async def nautobot_create_bgp_peer_group(
             return json.dumps({"success": True, "action": "already_exists", "name": name, "id": pg_resp["results"][0]["id"]})
 
         # Build payload
+        # PeerGroup has no status field in nautobot_bgp_models.
         payload = {
             "name": name,
             "routing_instance": instance_id,
             "enabled": True,
-            "status": "active",
         }
         if description:
             payload["description"] = description
         if remote_asn:
             asn_resp = await client.get("/api/plugins/bgp/autonomous-systems/", params={"asn": remote_asn})
-            if asn_resp.get("results"):
-                payload["autonomous_system"] = asn_resp["results"][0]["id"]
+            if not asn_resp.get("results"):
+                return json.dumps({"error": f"Autonomous system {remote_asn} not found. Create it first."})
+            payload["autonomous_system"] = asn_resp["results"][0]["id"]
         if source_interface:
             iface_resp = await client.get("/api/dcim/interfaces/", params={"device": device, "name": source_interface})
-            if iface_resp.get("results"):
-                payload["source_interface"] = iface_resp["results"][0]["id"]
+            if not iface_resp.get("results"):
+                return json.dumps({"error": f"Interface '{source_interface}' not found on device '{device}'"})
+            payload["source_interface"] = iface_resp["results"][0]["id"]
+
+        afis = [a.strip() for a in (address_families or "").split(",") if a.strip()]
+        if afis:
+            valid_afis = await _bgp_afi_choices("peer-group-address-families")
+            bad = [a for a in afis if a not in valid_afis]
+            if valid_afis and bad:
+                return json.dumps({"error": f"Invalid address_families {bad}. Valid: {sorted(valid_afis)}"})
 
         result = await client.post("/api/plugins/bgp/peer-groups/", json=payload)
         pg_id = result["id"]
 
-        # Add address families
-        if address_families:
-            for afi in address_families.split(","):
-                try:
-                    await client.post("/api/plugins/bgp/address-families/", json={
-                        "routing_instance": instance_id,
-                        "peer_group": pg_id,
-                        "afi_safi": afi.strip(),
-                    })
-                except Exception:
-                    pass
+        # Address families belong to the peer group (peer-group-address-families endpoint)
+        try:
+            for afi in afis:
+                await client.post("/api/plugins/bgp/peer-group-address-families/", json={
+                    "peer_group": pg_id,
+                    "afi_safi": afi,
+                })
+        except NautobotError:
+            await client.rest_delete(f"plugins/bgp/peer-groups/{pg_id}")
+            raise
 
-        return json.dumps({"success": True, "action": "created", "name": name, "id": pg_id})
+        return json.dumps({"success": True, "action": "created", "name": name, "id": pg_id,
+                           "address_families": afis})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
