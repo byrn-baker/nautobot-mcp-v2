@@ -209,7 +209,15 @@ class NautobotClient:
             "circuit_type": '{{ circuit_types(name: "{}") {{ id }} }}'.format(_esc(name)),
             "tag": '{{ tags(name: "{}") {{ id }} }}'.format(_esc(name)),
             "route_target": '{{ route_targets(name: "{}") {{ id }} }}'.format(_esc(name)),
+            "circuit": '{{ circuits(cid: "{}") {{ id }} }}'.format(_esc(name)),
+            "provider_network": '{{ provider_networks(name: "{}") {{ id }} }}'.format(_esc(name)),
+            # BGP models plugin: ASN by number, routing instance by device name
+            "bgp_routing_instance": '{{ bgp_routing_instances(device: "{}") {{ id }} }}'.format(_esc(name)),
         }
+        if object_type == "autonomous_system":
+            if not str(name).isdigit():
+                raise NautobotError(f"Autonomous system must be an ASN number, got '{name}'")
+            query_map["autonomous_system"] = f"{{ autonomous_systems(asn: {int(name)}) {{ id }} }}"
 
         if object_type == "namespace":
             # Namespaces use REST — not always in GraphQL

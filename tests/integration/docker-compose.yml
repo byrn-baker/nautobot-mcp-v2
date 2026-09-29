@@ -1,0 +1,44 @@
+# Local throwaway Nautobot for MCP write-tool integration tests. Never points at production.
+#   docker compose -f tests/integration/docker-compose.yml up -d --build
+#   docker compose -f tests/integration/docker-compose.yml down -v
+x-nautobot-env: &nautobot-env
+  NAUTOBOT_DB_HOST: db
+  NAUTOBOT_DB_NAME: nautobot
+  NAUTOBOT_DB_USER: nautobot
+  NAUTOBOT_DB_PASSWORD: nautobot-test-only
+  NAUTOBOT_REDIS_HOST: redis
+  NAUTOBOT_REDIS_PASSWORD: ""
+  NAUTOBOT_SECRET_KEY: local-integration-test-secret-key-not-for-production-use-0123456789
+  NAUTOBOT_ALLOWED_HOSTS: "*"
+  NAUTOBOT_CREATE_SUPERUSER: "true"
+  NAUTOBOT_SUPERUSER_NAME: admin
+  NAUTOBOT_SUPERUSER_PASSWORD: admin-test-only
+  NAUTOBOT_SUPERUSER_EMAIL: admin@example.com
+  NAUTOBOT_SUPERUSER_API_TOKEN: "0123456789abcdef0123456789abcdef01234567"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nautobot
+      POSTGRES_USER: nautobot
+      POSTGRES_PASSWORD: nautobot-test-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nautobot"]
+      interval: 5s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+  nautobot:
+    build: .
+    image: nautobot-mcp-test:3.1.8
+    environment: *nautobot-env
+    ports: ["127.0.0.1:18080:8080"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+  worker:
+    image: nautobot-mcp-test:3.1.8
+    command: nautobot-server celery worker -l INFO
+    environment: *nautobot-env
+    depends_on: [nautobot]
