@@ -2226,6 +2226,106 @@ async def nautobot_assign_ip_to_vm(
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool()
+async def nautobot_assign_existing_ip_to_interface(
+    address: str,
+    interface: str,
+    virtual_machine: Optional[str] = None,
+    device: Optional[str] = None,
+    namespace: str = "Global",
+    set_primary: bool = False,
+    cr_number: Optional[str] = None,
+) -> str:
+    """Attach an EXISTING IP address to a VM or device interface. Never creates the IP. ITSM-gated.
+
+    Use for shared/Anycast addresses (one IP object on many interfaces), or adding a second
+    address family to an interface. Mirrors networktocode.nautobot.ip_address_to_interface.
+    Idempotent: returns already_assigned if the IP is already on that interface.
+
+    Args:
+        address: Existing IP with mask (e.g. '2600:6c7f::241/128') or its UUID
+        interface: Interface name on the VM/device (e.g. 'lo'), or the interface UUID
+        virtual_machine: VM name (give this OR device)
+        device: Device name (give this OR virtual_machine)
+        namespace: IPAM namespace used to find the IP by address (default Global)
+        set_primary: Also set the IP as the VM/device primary_ip4 or primary_ip6 (by family)
+    """
+    blocked = _check_itsm(cr_number)
+    if blocked:
+        return json.dumps({"error": blocked})
+    if bool(virtual_machine) == bool(device):
+        return json.dumps({"error": "Provide exactly one of virtual_machine or device"})
+    logger.info(
+        f"nautobot_assign_existing_ip_to_interface {address} -> {virtual_machine or device}:{interface} cr={cr_number}"
+    )
+    try:
+        # Resolve the existing IP (never create it)
+        if _looks_like_uuid(address):
+            ip = await client.rest_get(f"ipam/ip-addresses/{address}")
+        else:
+            resp = await client.rest_get("ipam/ip-addresses", {"address": address, "namespace": namespace})
+            results = resp.get("results", [])
+            if not results:
+                return json.dumps({"error": f"IP address {address} not found in namespace {namespace}. "
+                                            "This tool only attaches existing IPs; create it first."})
+            if len(results) > 1:
+                return json.dumps({"error": f"IP address {address} matches {len(results)} objects in "
+                                            f"namespace {namespace}; pass the IP UUID instead."})
+            ip = results[0]
+        ip_id = ip["id"]
+        ip_addr = ip.get("address", address)
+
+        # Resolve the interface
+        if virtual_machine:
+            iface_field, parent_ep, parent_name = "vm_interface", "virtualization/virtual-machines", virtual_machine
+            if _looks_like_uuid(interface):
+                iface_id = interface
+            else:
+                data = await client.graphql(
+                    f'{{ vm_interfaces(virtual_machine: "{_esc(virtual_machine)}", name: "{_esc(interface)}") {{ id }} }}'
+                )
+                items = data.get("vm_interfaces", [])
+                if not items:
+                    return json.dumps({"error": f"VM interface {virtual_machine}:{interface} not found"})
+                iface_id = items[0]["id"]
+        else:
+            iface_field, parent_ep, parent_name = "interface", "dcim/devices", device
+            iface_id = interface if _looks_like_uuid(interface) else await client.resolve_id(
+                "interface", f"{device}:{interface}"
+            )
+
+        # Idempotent M2M assignment
+        existing = await client.rest_get(
+            "ipam/ip-address-to-interface", {"ip_address": ip_id, iface_field: iface_id}
+        )
+        if existing.get("results"):
+            action = "already_assigned"
+        else:
+            await client.rest_post("ipam/ip-address-to-interface", {"ip_address": ip_id, iface_field: iface_id})
+            action = "assigned"
+
+        primary_field = None
+        if set_primary:
+            import ipaddress as ipaddr
+            primary_field = "primary_ip6" if ipaddr.ip_interface(ip_addr).version == 6 else "primary_ip4"
+            parents = await client.rest_get(parent_ep, {"name": parent_name})
+            if not parents.get("results"):
+                return json.dumps({"error": f"{parent_name} not found when setting {primary_field}",
+                                   "action": action})
+            await client.rest_patch(f"{parent_ep}/{parents['results'][0]['id']}", {primary_field: ip_id})
+
+        return json.dumps({
+            "success": True,
+            "action": action,
+            "ip_address": ip_addr,
+            "ip_id": ip_id,
+            "assigned_to": f"{virtual_machine or device}:{interface}",
+            "primary": primary_field or False,
+        }, indent=2)
+    except (NautobotError, ValueError) as e:
+        return json.dumps({"error": str(e)})
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # GENERIC CRUD TOOLS — Registry-embedded for zero-iteration usage
 # ═══════════════════════════════════════════════════════════════════════
