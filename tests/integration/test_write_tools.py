@@ -306,6 +306,7 @@ async def test_itsm_blocks_writes_without_cr(tools, monkeypatch):
     monkeypatch.setattr(server, "ITSM_LAB_MODE", False)
     calls = {
         "nautobot_create_vm_interface": {"virtual_machine": "x", "name": "eth0"},
+        "nautobot_assign_existing_ip_to_interface": {"address": "10.0.0.1/32", "interface": "lo", "virtual_machine": "x"},
         "nautobot_run_job": {"job_id": "x"},
         "nautobot_enable_job": {"job_id": "x"},
         "nautobot_create_interface": {"device": "x", "name": "y"},
@@ -467,3 +468,66 @@ async def test_vm_create_bad_custom_fields_json(tools, seed):
     out = await tools("nautobot_create_virtual_machine", name=uid("vm-bad"), cluster="mcpt-cluster",
                       custom_fields="{not json")
     assert "Invalid custom_fields JSON" in out["error"]
+
+
+# ── Attach existing (shared / Anycast) IPs without creating them ─────
+
+
+async def test_assign_existing_anycast_ip_to_many_interfaces(tools, api, seed):
+    await tools.ok("nautobot_create", object_type="prefix",
+                   data={"prefix": f"fd01:{RUN[:4]}::/64", "status": "Active", "namespace": "Global"})
+    v4, v6 = f"{NET}.110.241/32", f"fd01:{RUN[:4]}::241/128"
+    await tools.ok("nautobot_create_ip_address", address=v4)
+    await tools.ok("nautobot_create_ip_address", address=v6)
+    ip_count_before = (await rest(api, "ipam/ip-addresses/", q=f"{NET}.110."))["count"]
+
+    vms = [uid(f"anycast{i}") for i in range(3)]
+    for vm in vms:
+        await tools.ok("nautobot_create_virtual_machine", name=vm, cluster="mcpt-cluster")
+        await tools.ok("nautobot_create_vm_interface", virtual_machine=vm, name="lo")
+        # Both families onto the same lo, from the same shared IP objects
+        a = await tools.ok("nautobot_assign_existing_ip_to_interface", address=v4, virtual_machine=vm, interface="lo")
+        b = await tools.ok("nautobot_assign_existing_ip_to_interface", address=v6, virtual_machine=vm,
+                           interface="lo", set_primary=True)
+        assert a["action"] == "assigned" and b["action"] == "assigned" and b["primary"] == "primary_ip6"
+        iface = await one(api, "virtualization/interfaces", virtual_machine=vm, name="lo")
+        assoc = await rest(api, "ipam/ip-address-to-interface/", vm_interface=iface["id"])
+        assert sorted(x["ip_address"]["display"] for x in assoc["results"]) == sorted([v4, v6])
+        assert (await one(api, "virtualization/virtual-machines", name=vm))["primary_ip6"]["address"] == v6
+
+    # One IP object shared by all three interfaces; no new IPs created
+    ip4 = await one(api, "ipam/ip-addresses", address=v4)
+    assert (await rest(api, "ipam/ip-address-to-interface/", ip_address=ip4["id"]))["count"] == 3
+    assert (await rest(api, "ipam/ip-addresses/", q=f"{NET}.110."))["count"] == ip_count_before
+
+    # Idempotent re-run
+    again = await tools.ok("nautobot_assign_existing_ip_to_interface", address=v4, virtual_machine=vms[0], interface="lo")
+    assert again["action"] == "already_assigned"
+
+
+async def test_assign_existing_ip_to_device_interface(tools, api, seed):
+    addr = f"{NET}.111.9/24"
+    await tools.ok("nautobot_create_ip_address", address=addr)
+    await tools.ok("nautobot_create_interface", device="mcpt-dev1", name=uid("lo-ex"))
+    out = await tools.ok("nautobot_assign_existing_ip_to_interface", address=addr, device="mcpt-dev1",
+                         interface=uid("lo-ex"))
+    assert out["action"] == "assigned"
+    ip = await one(api, "ipam/ip-addresses", address=addr)
+    assoc = await rest(api, "ipam/ip-address-to-interface/", ip_address=ip["id"])
+    assert assoc["results"][0]["interface"]["display"].startswith(uid("lo-ex"))
+
+
+async def test_assign_existing_ip_never_creates(tools, api, seed):
+    missing = f"{NET}.112.1/32"
+    vm = uid("anycast-none")
+    await tools.ok("nautobot_create_virtual_machine", name=vm, cluster="mcpt-cluster")
+    await tools.ok("nautobot_create_vm_interface", virtual_machine=vm, name="lo")
+    out = await tools("nautobot_assign_existing_ip_to_interface", address=missing, virtual_machine=vm, interface="lo")
+    assert "not found" in out["error"]
+    assert (await rest(api, "ipam/ip-addresses/", address=missing))["count"] == 0
+    both = await tools("nautobot_assign_existing_ip_to_interface", address=missing, virtual_machine=vm,
+                       device="mcpt-dev1", interface="lo")
+    assert "exactly one" in both["error"]
+    bad_if = await tools("nautobot_assign_existing_ip_to_interface", address=f"{NET}.111.9/24",
+                         virtual_machine=vm, interface="nope")
+    assert "not found" in bad_if["error"]
